@@ -15,10 +15,3 @@ etf-analysis
 - **完整统计摘要**：展示 R²、调整 R²、AIC、BIC、各回归系数及其 p 值，以及 1~7 阶对比表。
 
 ---
-
-## 💻 本地运行
-
-### 1. 克隆或下载本项目
-```bash
-git clone https://github.com/your-username/your-repo-name.git
-cd your-repo-name
