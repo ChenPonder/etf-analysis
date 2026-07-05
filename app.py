@@ -3,9 +3,10 @@
 
 """
 A股ETF多项式回归分析 - 基于统计学的自动阶数选择
-支持自动识别市场后缀（.SH / .SZ）
+支持自动识别市场后缀（.SH / .SZ），修复深市159开头识别问题
 采用序贯F检验 + BIC最小化 + 交叉验证(1-SE法则)
 固定预测未来7个交易日
+拟合值与预测值均显示预测区间（obs_ci）
 """
 
 import streamlit as st
@@ -39,18 +40,24 @@ analyze_btn = st.sidebar.button("开始分析", type="primary")
 st.sidebar.info("预测天数固定为 7 天\n阶数自动在 1~7 中优选（统计学准则）")
 st.sidebar.caption("💡 系统自动识别上海（.SH）或深圳（.SZ）市场")
 
-# ---------- 辅助函数：自动补全市场后缀 ----------
+# ---------- 辅助函数：自动补全市场后缀（修复版） ----------
 def normalize_symbol(symbol):
-    """自动补全市场后缀（用户无需输入 .SH 或 .SZ）"""
+    """根据 ETF 代码前缀自动补全市场后缀（支持159开头的深市ETF）"""
     symbol = symbol.strip().upper()
     if '.' in symbol:
         return symbol
-    if symbol.startswith('6'):
+    sh_prefixes = ('510', '511', '512', '513', '515', '516', '517', '518',
+                   '560', '561', '562', '563', '588')
+    sz_prefixes = ('159', '160', '161', '162', '163', '164', '165', '166', '167', '168', '169')
+    if symbol.startswith(sh_prefixes):
         return f"{symbol}.SH"
-    elif symbol.startswith('0') or symbol.startswith('3'):
+    elif symbol.startswith(sz_prefixes):
         return f"{symbol}.SZ"
     else:
-        return f"{symbol}.SH"   # 默认上海
+        if symbol.startswith(('0', '3')):
+            return f"{symbol}.SZ"
+        else:
+            return f"{symbol}.SH"
 
 # ---------- 数据获取 ----------
 @st.cache_data(show_spinner=False)
@@ -67,7 +74,7 @@ def get_data(symbol):
 
 # ---------- 核心建模函数 ----------
 def build_model_stats(data, predict_days, order):
-    """返回包含 AIC/BIC/F-test 结果的模型字典"""
+    """返回包含 AIC/BIC/F-test 结果的模型字典，拟合值使用预测区间（obs_ci）"""
     n = len(data)
     X_seq = np.arange(1, n + 1).reshape(-1, 1)
     X_poly = np.column_stack([X_seq ** i for i in range(1, order + 1)])
@@ -82,6 +89,13 @@ def build_model_stats(data, predict_days, order):
     coeffs = {f'coef_{i}': p for i, p in enumerate(params)}
     p_values = {f'p_{i}': pv for i, pv in enumerate(pvals)}
     
+    # 拟合值的预测区间（obs_ci，更宽）
+    fitted_pred = results.get_prediction(X_poly_const)
+    fitted_summary = fitted_pred.summary_frame(alpha=0.05)
+    fitted_ci_lower = fitted_summary['obs_ci_lower'].values   # 改为预测区间
+    fitted_ci_upper = fitted_summary['obs_ci_upper'].values   # 改为预测区间
+    
+    # 未来预测值的预测区间（obs_ci）
     future_X = np.arange(n + 1, n + predict_days + 1).reshape(-1, 1)
     future_X_poly = np.column_stack([future_X ** i for i in range(1, order + 1)])
     future_X_poly_const = sm.add_constant(future_X_poly)
@@ -98,6 +112,8 @@ def build_model_stats(data, predict_days, order):
         'bic': results.bic,
         'f_pvalue': results.f_pvalue,
         'fitted': results.fittedvalues,
+        'fitted_ci_lower': fitted_ci_lower,
+        'fitted_ci_upper': fitted_ci_upper,
         'n': n,
         'order': order,
         'pred_values': pred_summary['mean'].values,
@@ -108,7 +124,7 @@ def build_model_stats(data, predict_days, order):
         'mse': np.mean(results.resid ** 2)
     }
 
-# ---------- 交叉验证（5折，计算MSE） ----------
+# ---------- 交叉验证 ----------
 def get_cv_mse(data, order):
     X = np.arange(1, len(data) + 1).reshape(-1, 1)
     y = data['close'].values
@@ -119,17 +135,15 @@ def get_cv_mse(data, order):
     scores = cross_val_score(pipeline, X, y, cv=5, scoring='neg_mean_squared_error')
     return -scores.mean()
 
-# ---------- 主选择函数（统计准则） ----------
+# ---------- 主选择函数 ----------
 def select_best_model_statistical(data, predict_days):
     max_order = 7
     candidates = []
-    cv_mse_dict = {}
     
     for order in range(1, max_order + 1):
         try:
             model_dict = build_model_stats(data, predict_days, order)
             cv_mse = get_cv_mse(data, order)
-            cv_mse_dict[order] = cv_mse
             model_dict['cv_mse'] = cv_mse
             candidates.append(model_dict)
         except Exception as e:
@@ -177,11 +191,13 @@ def select_best_model_statistical(data, predict_days):
     
     return best
 
-# ---------- 绘图函数 ----------
+# ---------- 绘图函数（拟合+预测均使用预测区间） ----------
 def create_figure(data, model_dict, symbol, predict_days):
     dates = data['date']
     actual = data['close']
     fitted = model_dict['fitted']
+    fitted_ci_lower = model_dict['fitted_ci_lower']
+    fitted_ci_upper = model_dict['fitted_ci_upper']
     pred_values = model_dict['pred_values']
     ci_lower = model_dict['ci_lower']
     ci_upper = model_dict['ci_upper']
@@ -191,31 +207,75 @@ def create_figure(data, model_dict, symbol, predict_days):
     pred_dates = [last_date + timedelta(days=i+1) for i in range(len(pred_values))]
     
     fig = go.Figure()
+    
+    # 1. 实际收盘价
     fig.add_trace(go.Scatter(x=dates, y=actual, mode='lines', name='实际收盘价',
                              line=dict(color='#1f77b4', width=2.5),
                              hovertemplate='<b>%{x|%Y/%m/%d}</b><br>收盘价: %{y:.4f}<extra></extra>'))
+    
+    # 2. 拟合值预测区间（红色带状 + 虚线）
+    x_fit = list(dates) + list(dates[::-1])
+    y_fit = list(fitted_ci_upper) + list(fitted_ci_lower[::-1])
+    fig.add_trace(go.Scatter(
+        x=x_fit,
+        y=y_fit,
+        fill='toself',
+        fillcolor='rgba(214,39,40,0.2)',
+        line=dict(color='rgba(255,255,255,0)'),
+        name='拟合值 95% 预测区间',
+        hoverinfo='skip'
+    ))
+    fig.add_trace(go.Scatter(
+        x=dates, y=fitted_ci_upper,
+        mode='lines', name='拟合上限 (95% PI)',
+        line=dict(color='rgba(214,39,40,0.5)', width=1, dash='dash'),
+        hoverinfo='skip'
+    ))
+    fig.add_trace(go.Scatter(
+        x=dates, y=fitted_ci_lower,
+        mode='lines', name='拟合下限 (95% PI)',
+        line=dict(color='rgba(214,39,40,0.5)', width=1, dash='dash'),
+        hoverinfo='skip'
+    ))
+    
+    # 3. 模型拟合值（虚线）
     fig.add_trace(go.Scatter(x=dates, y=fitted, mode='lines', name='模型拟合值',
                              line=dict(color='#d62728', width=2, dash='dash'),
                              hovertemplate='<b>%{x|%Y/%m/%d}</b><br>拟合值: %{y:.4f}<extra></extra>'))
+    
+    # 4. 预测值（点线）
     fig.add_trace(go.Scatter(x=pred_dates, y=pred_values, mode='lines+markers',
                              name='预测 (t+1 ~ t+7)',
                              line=dict(color='#2ca02c', width=2, dash='dot'),
                              marker=dict(color='#2ca02c', size=8),
                              hovertemplate='<b>%{x|%Y/%m/%d}</b><br>预测值: %{y:.4f}<extra></extra>'))
     
-    for i, (x, y, lo, hi) in enumerate(zip(pred_dates, pred_values, ci_lower, ci_upper)):
-        fig.add_trace(go.Scatter(x=[x], y=[y], mode='markers', name='95% CI' if i==0 else None,
-                                 marker=dict(size=0),
-                                 error_y=dict(type='data', symmetric=False,
-                                              array=[hi-y], arrayminus=[y-lo],
-                                              color='#2ca02c', thickness=2, width=8)))
+    # 5. 预测值 95% 预测区间（绿色带状 + 虚线）
+    x_pred = pred_dates + pred_dates[::-1]
+    y_pred = list(ci_upper) + list(ci_lower[::-1])
+    fig.add_trace(go.Scatter(
+        x=x_pred,
+        y=y_pred,
+        fill='toself',
+        fillcolor='rgba(44,160,44,0.15)',
+        line=dict(color='rgba(255,255,255,0)'),
+        name='预测值 95% 预测区间',
+        hoverinfo='skip'
+    ))
+    fig.add_trace(go.Scatter(
+        x=pred_dates, y=ci_upper,
+        mode='lines', name='预测上限 (95% PI)',
+        line=dict(color='rgba(44,160,44,0.6)', width=1.5, dash='dash'),
+        hoverinfo='skip'
+    ))
+    fig.add_trace(go.Scatter(
+        x=pred_dates, y=ci_lower,
+        mode='lines', name='预测下限 (95% PI)',
+        line=dict(color='rgba(44,160,44,0.6)', width=1.5, dash='dash'),
+        hoverinfo='skip'
+    ))
     
-    fig.add_trace(go.Scatter(x=pred_dates + pred_dates[::-1],
-                             y=list(ci_upper) + list(ci_lower[::-1]),
-                             fill='toself', fillcolor='rgba(44,160,44,0.15)',
-                             line=dict(color='rgba(255,255,255,0)'),
-                             name='95% CI（带状）', hoverinfo='skip'))
-    
+    # 布局
     fig.update_layout(title=f"{symbol} {order} 阶多项式回归（未来7天预测）",
                       xaxis=dict(title="日期", tickformat='%Y/%m/%d', rangeslider=dict(visible=True),
                                  rangeselector=dict(buttons=[dict(count=1, label="1月", step="month", stepmode="backward"),
@@ -230,11 +290,12 @@ def create_figure(data, model_dict, symbol, predict_days):
     
     all_dates = list(dates) + pred_dates
     fig.update_xaxes(range=[all_dates[0], all_dates[-1] + timedelta(days=2)])
-    fig.update_yaxes(range=[min(actual.min(), ci_lower.min())*0.95,
-                             max(actual.max(), ci_upper.max())*1.05])
+    y_min = min(actual.min(), fitted_ci_lower.min(), ci_lower.min()) * 0.95
+    y_max = max(actual.max(), fitted_ci_upper.max(), ci_upper.max()) * 1.05
+    fig.update_yaxes(range=[y_min, y_max])
     return fig
 
-# ---------- 辅助：公式生成 ----------
+# ---------- 公式生成 ----------
 def generate_formula(model_dict):
     coeffs = model_dict['coeffs']
     terms = [f"{coeffs['coef_0']:.6f}"]
@@ -249,7 +310,7 @@ def generate_formula(model_dict):
 # ---------- 主程序 ----------
 if analyze_btn:
     raw_symbol = default_symbol.strip()
-    symbol = normalize_symbol(raw_symbol)  # 自动补全后缀
+    symbol = normalize_symbol(raw_symbol)
     predict_days = 7
     
     with st.spinner(f"正在获取 {symbol} 数据并基于统计学准则（F检验+BIC+CV）选择最优阶数（1~7阶）..."):
@@ -265,21 +326,17 @@ if analyze_btn:
             st.error(f"模型选择失败: {e}")
             st.stop()
         
-        # 展示选择说明
         st.info(best['selection_note'])
         
-        # 展示各阶数对比表
         with st.expander("📋 查看 1~7 阶详细对比数据（调整R²、AIC、BIC、CV-MSE）"):
             st.dataframe(best['all_orders_summary'], use_container_width=True)
         
-        # 数据概览
         st.subheader("📊 数据概览")
         col1, col2, col3 = st.columns(3)
         col1.metric("数据点数", best['n'])
         col2.metric("起始日期", data['date'].min().strftime('%Y/%m/%d'))
         col3.metric("最新日期", data['date'].max().strftime('%Y/%m/%d'))
         
-        # 模型摘要
         st.subheader("📐 回归模型摘要")
         col1, col2 = st.columns(2)
         with col1:
@@ -299,23 +356,20 @@ if analyze_btn:
             st.dataframe(coef_df, column_config={"p 值": st.column_config.NumberColumn(format="%.2f")},
                          use_container_width=True)
         
-        # 预测结果
-        st.subheader("🔮 未来 7 个交易日预测 (95% 置信区间)")
+        st.subheader("🔮 未来 7 个交易日预测 (95% 预测区间)")
         pred_df = pd.DataFrame({
             '交易日': [f"t+{i+1}" for i in range(7)],
             '序列号': best['future_X'],
             '预测收盘价': best['pred_values'],
-            '下限 (95% CI)': best['ci_lower'],
-            '上限 (95% CI)': best['ci_upper']
+            '下限 (95% PI)': best['ci_lower'],
+            '上限 (95% PI)': best['ci_upper']
         })
         st.dataframe(pred_df, use_container_width=True)
         
-        # 图表
         st.subheader("📈 价格走势与预测图")
         fig = create_figure(data, best, symbol, predict_days)
         st.plotly_chart(fig, use_container_width=True)
         
-        # 公式
         st.subheader("📝 模型公式")
         st.latex(generate_formula(best))
 
